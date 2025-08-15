@@ -646,3 +646,384 @@
     none
   )
 )
+
+;; Emergency Escalation and Priority System
+(define-constant ERR_INVALID_PRIORITY_LEVEL (err u113))
+(define-constant ERR_ESCALATION_NOT_REQUIRED (err u114))
+(define-constant ERR_INVALID_SEVERITY (err u115))
+(define-constant ERR_EMERGENCY_NOT_ESCALATED (err u116))
+
+(define-data-var next-escalation-id uint u1)
+(define-data-var global-priority-threshold uint u750) ;; Out of 1000 points
+(define-data-var escalation-time-window uint u144) ;; Blocks (approximately 24 hours)
+
+;; Priority levels: 1=Low, 2=Medium, 3=High, 4=Critical
+(define-map emergency-priorities
+  { emergency-id: uint }
+  {
+    current-priority: uint,
+    severity-level: uint,
+    priority-score: uint,
+    last-calculated-at: uint,
+    funding-gap-percentage: uint,
+    time-factor: uint,
+    victim-density-factor: uint,
+    escalation-count: uint,
+    auto-escalated: bool,
+    critical-alert-sent: bool
+  }
+)
+
+;; Track escalation history and actions
+(define-map escalation-log
+  { escalation-id: uint }
+  {
+    emergency-id: uint,
+    escalated-from: uint,
+    escalated-to: uint,
+    escalated-at: uint,
+    escalation-reason: (string-ascii 200),
+    escalated-by: principal,
+    priority-score-before: uint,
+    priority-score-after: uint
+  }
+)
+
+;; Priority-based victim processing queue
+(define-map priority-victim-queue
+  { emergency-id: uint, priority-order: uint }
+  {
+    victim-id: uint,
+    queue-position: uint,
+    priority-weight: uint,
+    added-at: uint
+  }
+)
+
+;; Emergency alert system for critical situations
+(define-map critical-alerts
+  { alert-id: uint }
+  {
+    emergency-id: uint,
+    alert-type: (string-ascii 50),
+    alert-message: (string-ascii 300),
+    triggered-at: uint,
+    acknowledged-by: (optional principal),
+    acknowledged-at: (optional uint),
+    resolution-required: bool
+  }
+)
+
+;; Resource allocation recommendations
+(define-map resource-recommendations
+  { emergency-id: uint }
+  {
+    recommended-funding: uint,
+    funding-urgency: uint,
+    victim-processing-priority: uint,
+    resource-reallocation-suggested: bool,
+    last-updated: uint
+  }
+)
+
+;; Initialize emergency priority when created
+(define-public (set-emergency-priority (emergency-id uint) (severity-level uint))
+  (let
+    (
+      (emergency (unwrap! (map-get? emergencies { emergency-id: emergency-id }) ERR_INVALID_EMERGENCY))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (and (>= severity-level u1) (<= severity-level u4)) ERR_INVALID_SEVERITY)
+    (asserts! (get is-active emergency) ERR_EMERGENCY_INACTIVE)
+    
+    (map-set emergency-priorities
+      { emergency-id: emergency-id }
+      {
+        current-priority: severity-level,
+        severity-level: severity-level,
+        priority-score: (* severity-level u200), ;; Base score
+        last-calculated-at: current-block,
+        funding-gap-percentage: u100,
+        time-factor: u100,
+        victim-density-factor: u100,
+        escalation-count: u0,
+        auto-escalated: false,
+        critical-alert-sent: false
+      }
+    )
+    
+    (map-set resource-recommendations
+      { emergency-id: emergency-id }
+      {
+        recommended-funding: u0,
+        funding-urgency: severity-level,
+        victim-processing-priority: severity-level,
+        resource-reallocation-suggested: false,
+        last-updated: current-block
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Calculate dynamic priority score based on multiple factors
+(define-public (calculate-emergency-priority (emergency-id uint))
+  (let
+    (
+      (emergency (unwrap! (map-get? emergencies { emergency-id: emergency-id }) ERR_INVALID_EMERGENCY))
+      (emergency-stats-data (unwrap! (map-get? emergency-stats { emergency-id: emergency-id }) ERR_INVALID_EMERGENCY))
+      (current-priority (unwrap! (map-get? emergency-priorities { emergency-id: emergency-id }) ERR_INVALID_PRIORITY_LEVEL))
+      (current-block stacks-block-height)
+      (time-elapsed (- current-block (get created-at emergency)))
+      
+      ;; Calculate funding gap percentage
+      (total-fund (get total-fund emergency))
+      (remaining-fund (get remaining-fund emergency-stats-data))
+      (funding-gap-pct (if (> total-fund u0) (/ (* (- total-fund remaining-fund) u100) total-fund) u0))
+      
+      ;; Calculate time factor (increases urgency over time)
+      (time-factor-calc (/ (* time-elapsed u300) (var-get escalation-time-window)))
+      (time-factor (if (> time-factor-calc u400) u400 time-factor-calc))
+      
+      ;; Calculate victim density factor
+      (total-victims (get total-victims emergency-stats-data))
+      (victim-factor-calc (* total-victims u20))
+      (victim-factor (if (> victim-factor-calc u200) u200 victim-factor-calc))
+      
+      ;; Calculate base severity score
+      (severity-score (* (get severity-level current-priority) u200))
+      
+      ;; Calculate composite priority score
+      (priority-score (+ severity-score time-factor victim-factor funding-gap-pct))
+      
+      ;; Determine new priority level
+      (new-priority-level 
+        (if (>= priority-score u800) u4 ;; Critical
+          (if (>= priority-score u600) u3 ;; High
+            (if (>= priority-score u400) u2 ;; Medium
+              u1 ;; Low
+            )
+          )
+        )
+      )
+    )
+    (asserts! (get is-active emergency) ERR_EMERGENCY_INACTIVE)
+    
+    ;; Update priority data
+    (map-set emergency-priorities
+      { emergency-id: emergency-id }
+      (merge current-priority {
+        current-priority: new-priority-level,
+        priority-score: priority-score,
+        last-calculated-at: current-block,
+        funding-gap-percentage: funding-gap-pct,
+        time-factor: time-factor,
+        victim-density-factor: victim-factor
+      })
+    )
+    
+    ;; Check if escalation is needed
+    (if (> new-priority-level (get current-priority current-priority))
+      (try! (auto-escalate-emergency emergency-id (get current-priority current-priority) new-priority-level))
+      true
+    )
+    
+    ;; Generate critical alert if needed
+    (if (and (is-eq new-priority-level u4) (not (get critical-alert-sent current-priority)))
+      (try! (generate-critical-alert emergency-id))
+      true
+    )
+    
+    (ok priority-score)
+  )
+)
+
+;; Automatic escalation when priority increases
+(define-private (auto-escalate-emergency (emergency-id uint) (old-priority uint) (new-priority uint))
+  (let
+    (
+      (escalation-id (var-get next-escalation-id))
+      (current-block stacks-block-height)
+      (current-priority (unwrap! (map-get? emergency-priorities { emergency-id: emergency-id }) ERR_INVALID_PRIORITY_LEVEL))
+      (escalation-reason (get-escalation-reason old-priority new-priority))
+    )
+    ;; Log the escalation
+    (map-set escalation-log
+      { escalation-id: escalation-id }
+      {
+        emergency-id: emergency-id,
+        escalated-from: old-priority,
+        escalated-to: new-priority,
+        escalated-at: current-block,
+        escalation-reason: escalation-reason,
+        escalated-by: CONTRACT_OWNER,
+        priority-score-before: (get priority-score current-priority),
+        priority-score-after: (get priority-score current-priority)
+      }
+    )
+    
+    ;; Update escalation count
+    (map-set emergency-priorities
+      { emergency-id: emergency-id }
+      (merge current-priority {
+        escalation-count: (+ (get escalation-count current-priority) u1),
+        auto-escalated: true
+      })
+    )
+    
+    (var-set next-escalation-id (+ escalation-id u1))
+    (ok true)
+  )
+)
+
+;; Generate critical alerts for high-priority emergencies
+(define-private (generate-critical-alert (emergency-id uint))
+  (let
+    (
+      (alert-id (var-get next-escalation-id))
+      (emergency (unwrap! (map-get? emergencies { emergency-id: emergency-id }) ERR_INVALID_EMERGENCY))
+      (current-block stacks-block-height)
+      (current-priority (unwrap! (map-get? emergency-priorities { emergency-id: emergency-id }) ERR_INVALID_PRIORITY_LEVEL))
+    )
+    (map-set critical-alerts
+      { alert-id: alert-id }
+      {
+        emergency-id: emergency-id,
+        alert-type: "CRITICAL_PRIORITY",
+        alert-message: "Emergency requires immediate attention - critical priority level reached",
+        triggered-at: current-block,
+        acknowledged-by: none,
+        acknowledged-at: none,
+        resolution-required: true
+      }
+    )
+    
+    ;; Mark alert as sent
+    (map-set emergency-priorities
+      { emergency-id: emergency-id }
+      (merge current-priority { critical-alert-sent: true })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Get escalation reason based on priority change
+(define-private (get-escalation-reason (old-priority uint) (new-priority uint))
+  (if (is-eq new-priority u4) "CRITICAL: Immediate intervention required"
+    (if (is-eq new-priority u3) "HIGH: Significant funding gap or time pressure"
+      (if (is-eq new-priority u2) "MEDIUM: Moderate escalation needed"
+        "LOW: Standard priority level"
+      )
+    )
+  )
+)
+
+;; Manually escalate emergency (override)
+(define-public (manual-escalate-emergency (emergency-id uint) (new-priority uint) (reason (string-ascii 200)))
+  (let
+    (
+      (emergency (unwrap! (map-get? emergencies { emergency-id: emergency-id }) ERR_INVALID_EMERGENCY))
+      (current-priority (unwrap! (map-get? emergency-priorities { emergency-id: emergency-id }) ERR_INVALID_PRIORITY_LEVEL))
+      (escalation-id (var-get next-escalation-id))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (and (>= new-priority u1) (<= new-priority u4)) ERR_INVALID_PRIORITY_LEVEL)
+    (asserts! (get is-active emergency) ERR_EMERGENCY_INACTIVE)
+    (asserts! (> new-priority (get current-priority current-priority)) ERR_ESCALATION_NOT_REQUIRED)
+    
+    ;; Log manual escalation
+    (map-set escalation-log
+      { escalation-id: escalation-id }
+      {
+        emergency-id: emergency-id,
+        escalated-from: (get current-priority current-priority),
+        escalated-to: new-priority,
+        escalated-at: current-block,
+        escalation-reason: reason,
+        escalated-by: tx-sender,
+        priority-score-before: (get priority-score current-priority),
+        priority-score-after: (get priority-score current-priority)
+      }
+    )
+    
+    ;; Update priority
+    (map-set emergency-priorities
+      { emergency-id: emergency-id }
+      (merge current-priority {
+        current-priority: new-priority,
+        escalation-count: (+ (get escalation-count current-priority) u1),
+        last-calculated-at: current-block
+      })
+    )
+    
+    (var-set next-escalation-id (+ escalation-id u1))
+    (ok true)
+  )
+)
+
+;; Acknowledge critical alert
+(define-public (acknowledge-critical-alert (alert-id uint))
+  (let
+    (
+      (alert (unwrap! (map-get? critical-alerts { alert-id: alert-id }) ERR_INVALID_EMERGENCY))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-none (get acknowledged-by alert)) ERR_ALREADY_VERIFIED)
+    
+    (map-set critical-alerts
+      { alert-id: alert-id }
+      (merge alert {
+        acknowledged-by: (some tx-sender),
+        acknowledged-at: (some current-block)
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Get priority-ordered list of emergencies needing attention
+(define-read-only (get-priority-ordered-emergencies)
+  (ok "Priority ordering requires off-chain sorting of emergency priority scores")
+)
+
+;; Read-only functions for priority system
+(define-read-only (get-emergency-priority (emergency-id uint))
+  (map-get? emergency-priorities { emergency-id: emergency-id })
+)
+
+(define-read-only (get-escalation-log (escalation-id uint))
+  (map-get? escalation-log { escalation-id: escalation-id })
+)
+
+(define-read-only (get-critical-alert (alert-id uint))
+  (map-get? critical-alerts { alert-id: alert-id })
+)
+
+(define-read-only (get-resource-recommendations (emergency-id uint))
+  (map-get? resource-recommendations { emergency-id: emergency-id })
+)
+
+(define-read-only (get-priority-threshold)
+  (var-get global-priority-threshold)
+)
+
+(define-read-only (is-emergency-critical (emergency-id uint))
+  (match (map-get? emergency-priorities { emergency-id: emergency-id })
+    priority-data (is-eq (get current-priority priority-data) u4)
+    false
+  )
+)
+
+(define-read-only (get-escalation-count (emergency-id uint))
+  (match (map-get? emergency-priorities { emergency-id: emergency-id })
+    priority-data (some (get escalation-count priority-data))
+    none
+  )
+)
+
+
